@@ -3,6 +3,7 @@ package mapreduce
 import (
 	"fmt"
 	"strconv"
+	"sort"
 )
 
 // Debugging enabled?
@@ -40,4 +41,48 @@ func reduceName(jobName string, mapTask int, reduceTask int) string {
 // mergeName constructs the name of the output file of reduce task <reduceTask>
 func mergeName(jobName string, reduceTask int) string {
 	return "mrtmp." + jobName + "-res-" + strconv.Itoa(reduceTask)
+}
+
+type KeyValueList []KeyValue
+
+func (data KeyValueList) Len() int {
+	return len(data)
+}
+
+func (data KeyValueList) Less(i, j int) bool {
+	return data[i].Key < data[j].Key
+}
+
+func (data KeyValueList) Swap(i, j int) {
+	data[i], data[j] = data[j], data[i]
+}
+
+func (data KeyValueList) append(items []KeyValue) KeyValueList {
+	for _, item := range items {
+		data = append(data, item)
+	}
+	return data
+}
+
+type KeyValueMapping struct {
+	Key       string
+	ValueList []string
+}
+
+func (data KeyValueList) groupByKey() []KeyValueMapping {
+	sort.Sort(data)
+	var m []KeyValueMapping
+
+	var result []string
+	for i := 0; i < data.Len(); i++ {
+		result = append(result, data[i].Value)
+		if i == data.Len()-1 || data[i].Key != data[i+1].Key {
+			m = append(m, KeyValueMapping{
+				Key:       data[i].Key,
+				ValueList: result,
+			})
+			result = make([]string, 0)
+		}
+	}
+	return m
 }
