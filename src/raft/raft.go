@@ -213,6 +213,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer func() {
+		if rf.state == Candidate {
+			rf.turnFollower(rf.currentTerm)
+		}
 		rf.heartbeatNotify <- true
 		rf.mu.Unlock()
 	}()
@@ -347,16 +350,9 @@ func (rf *Raft) serverAsCandidate() {
 		rf.turnCandidate()
 		rf.mu.Unlock()
 	case <-rf.heartbeatNotify:
-		rf.mu.Lock()
-		rf.turnFollower(rf.currentTerm)
-		rf.mu.Unlock()
+		//收到通知，发现心跳
 	case <-rf.electLeaderNotify:
-		rf.mu.Lock()
-		if rf.state == Candidate {
-			debug("term %d server %d get %d vote=====%d, becoming leader...", rf.currentTerm, rf.me, rf.votedCount, len(rf.peers))
-			rf.turnLeader()
-		}
-		rf.mu.Unlock()
+		//收到通知，发现状态变为leader
 	}
 }
 
@@ -367,7 +363,9 @@ func (rf *Raft) serverAsFollower() {
 		rf.turnCandidate()
 		rf.mu.Unlock()
 	case <-rf.voteNotify:
+		//收到投票请求，状态不变
 	case <-rf.heartbeatNotify:
+		//收到心跳请求，状态不变
 	}
 }
 func (raft *Raft) isHeartbeat(args AppendEntriesArgs) bool {
@@ -443,6 +441,7 @@ func (rf *Raft) broadcastRequestVotes() {
 						rf.votedCount++
 					}
 					if rf.votedCount > len(rf.peers)/2 {
+						rf.turnLeader()
 						rf.electLeaderNotify <- true
 					}
 				}
