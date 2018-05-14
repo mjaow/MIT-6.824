@@ -195,7 +195,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	//If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
+	// 当rpc请求方term大于自己term时，立马转变为follower，并同步自己的term信息
 	if args.Term > rf.currentTerm {
 		rf.turnFollower(args.Term)
 	}
@@ -226,7 +226,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	//If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
+	// 当rpc请求方term大于自己term时，立马转变为follower，并同步自己的term信息
 	if args.Term > rf.currentTerm {
 		rf.turnFollower(args.Term)
 		reply.Success = true
