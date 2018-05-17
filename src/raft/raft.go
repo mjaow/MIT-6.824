@@ -172,10 +172,18 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) canVote(candidateId int, candidateLastLogIndex int, candidateLastLogTerm int) bool {
-	return rf.votedFor < 0 ||
-		rf.votedFor == candidateId ||
-		candidateLastLogTerm > rf.currentTerm ||
-		(candidateLastLogTerm == rf.currentTerm && candidateLastLogIndex > len(rf.log)-1)
+	return rf.agreeVote(candidateId) && //TODO 这个||有争议
+		rf.agreeLog(candidateLastLogTerm, candidateLastLogIndex)
+}
+
+func (rf *Raft) agreeLog(candidateLastLogTerm, candidateLastLogIndex int) bool {
+	return candidateLastLogTerm >= rf.currentTerm ||
+		(candidateLastLogTerm == rf.currentTerm &&
+			candidateLastLogIndex >= len(rf.log)-1)
+}
+
+func (rf *Raft) agreeVote(candidateId int) bool {
+	return rf.votedFor < 0 || rf.votedFor == candidateId
 }
 
 //
@@ -195,16 +203,19 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	// 当rpc请求方term大于自己term时，立马转变为follower，并同步自己的term信息
 	if args.Term > rf.currentTerm {
+		// 当rpc请求方term大于自己term时，立马转变为follower，并同步自己的term信息
 		rf.turnFollower(args.Term)
-	}
-
-	if rf.canVote(args.CandidatId, args.LastLogIndex, args.LastLogTerm) {
+		reply.Term = args.Term
+		reply.VoteGranted = true
+		rf.votedFor = args.CandidatId
+	} else if rf.canVote(args.CandidatId, args.LastLogIndex, args.LastLogTerm) {
+		//如果发现还没有投票，或者已投票给该候选人，并且候选人的日志不比自己旧，则投票给该候选人
 		reply.Term = args.Term
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidatId
 	} else {
+		//否则，投否决票，并将term更新为自己的term
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 	}
