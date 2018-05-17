@@ -172,8 +172,7 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) canVote(candidateId int, candidateLastLogIndex int, candidateLastLogTerm int) bool {
-	return rf.agreeVote(candidateId) && //TODO 这个||有争议
-		rf.agreeLog(candidateLastLogTerm, candidateLastLogIndex)
+	return rf.agreeVote(candidateId) && rf.agreeLog(candidateLastLogTerm, candidateLastLogIndex)
 }
 
 func (rf *Raft) agreeLog(candidateLastLogTerm, candidateLastLogIndex int) bool {
