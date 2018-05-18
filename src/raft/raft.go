@@ -220,15 +220,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 }
 
+//candidate或follower响应leader的AppendEntries请求
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer func() {
-		if rf.state == Candidate {
-			rf.turnFollower(rf.currentTerm)
-		}
 		rf.heartbeatNotify <- true
 		rf.mu.Unlock()
 	}()
+
+	//收敛状态，统一转换为follower进行处理
+	if rf.state == Candidate {
+		rf.turnFollower(rf.currentTerm)
+	}
 
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
@@ -487,6 +490,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electLeaderNotify = make(chan bool)
 	rf.heartbeatNotify = make(chan bool, len(rf.peers))
 	rf.voteNotify = make(chan bool, len(rf.peers))
+	rf.log = []LogEntry{{}} //初始化一个空日志，保证真正的第一个日志的索引为1
 	go rf.server()
 
 	// initialize from state persisted before a crash
