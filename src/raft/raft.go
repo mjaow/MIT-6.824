@@ -69,15 +69,13 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	state              int           // 所属的状态
-	heartbeatNotify    chan bool     //心跳通知
-	voteNotify         chan bool     //投票通知
-	electLeaderNotify  chan bool     //选举leader通知
-	logCommittedNotify chan bool     //提交日志通知
-	electionTimeout    time.Duration //选举超时channel
-	votedCount         int           //票数
-	logReplicas        int           //当前日志的副本数
-	leaderId           int           //领导者id
+	state             int           // 所属的状态
+	heartbeatNotify   chan bool     //心跳通知
+	voteNotify        chan bool     //投票通知
+	electLeaderNotify chan bool     //选举leader通知
+	electionTimeout   time.Duration //选举超时channel
+	votedCount        int           //票数
+	leaderId          int           //领导者id
 
 	//持久化数据
 	currentTerm int           // 最新term
@@ -355,7 +353,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -368,61 +365,81 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, isLeader
 	}
 
-	//如果是leader，则广播消息
-	rf.broadcastLogEntries(index, term, command)
+	rf.log = append(rf.log, LogEntry{
+		Command: command,
+		Term:    term,
+	})
 
 	return index, term, isLeader
 }
 
-func (rf *Raft) broadcastLogEntries(index, term int, command interface{}) {
-	lastLog := rf.log[index-1]
-
-	newLog := LogEntry{
-		Command: command,
-		Term:    term,
-	}
-
-	//首先添加到本地日志（local server）
-	rf.log = append(rf.log, newLog)
-
-	//leader给所有follower广播日志
+func (rf *Raft) broadcastAppendEntries() {
 	for i := range rf.peers {
-		if i != rf.me {
-			//将matchIndex开始的所有日志发送给Follower
-			go func(follower, leader, commitIndex int, nextIndex []int, matchIndex []int, log []LogEntry) {
-				request := AppendEntriesArgs{
-					Term:         term,
+		if i == rf.me {
+			rf.matchIndex[i]++
+			rf.nextIndex[i]++
+		} else if rf.nextIndex[i] <= len(rf.log)-1 {
+			go func(follower, leader, leaderTerm, leaderCommit, preLogIndex, preLogTerm int, appendLogs []LogEntry) {
+				req := AppendEntriesArgs{
+					Term:         leaderTerm,
 					LeaderId:     leader,
-					PreLogIndex:  index - 1,
-					PreLogTerm:   lastLog.Term,
-					Entries:      log[nextIndex[follower]:],
-					LeaderCommit: commitIndex,
+					PreLogIndex:  preLogIndex,
+					PreLogTerm:   preLogTerm,
+					Entries:      appendLogs,
+					LeaderCommit: leaderCommit,
 				}
-
-				response := AppendEntriesReply{}
-				if ok := rf.sendAppendEntries(follower, &request, &response); ok {
+				resp := AppendEntriesReply{}
+				if ok := rf.sendAppendEntries(follower, &req, &resp); ok {
 					rf.mu.Lock()
-					if response.Success {
-						rf.matchIndex[follower] = index
-						rf.nextIndex[follower] = index + 1
-						rf.logReplicas++
-						//debug("========>success %d", rf.logReplicas)
-					} else {
-						//如果rpc请求响应ok，但是response.Success为false，
+					if resp.Success {
+						rf.matchIndex[follower] = preLogIndex + len(appendLogs)
+						rf.nextIndex[follower] = rf.matchIndex[follower] + 1
+
+						for n := leaderCommit + 1; n < len(rf.log); n++ {
+
+							var replicas int
+
+							for m := range rf.peers {
+								if rf.matchIndex[m] >= n {
+									//debug("log %d is match in server %d", n, m)
+									replicas++
+								}
+							}
+
+							debug("replicas of log %d is %d", n, replicas)
+
+							if replicas > len(rf.peers)/2 && rf.log[n].Term == leaderTerm {
+								rf.commitIndex = n
+							}
+
+							replicas = 0
+						}
+
+					} else if resp.Term == leaderTerm {
+						//如果rpc请求响应ok，但是response.Success为false并且leader term没有过期，
 						// 则表示日志的一致性check检测到冲突，就将nextIndex减一
 						rf.nextIndex[follower]--
 					}
-
-					if rf.logReplicas > len(rf.peers)/2 && index > rf.commitIndex && rf.log[index].Term == rf.currentTerm {
-						//debug("=======>log replicas is %d and peers is %d.index %d and commit index %d and log term %d and current term %d", rf.logReplicas, len(rf.peers), index, rf.commitIndex, rf.log[index].Term, rf.currentTerm)
-						rf.commitIndex = index
-						rf.logReplicas = 0
-					}
-
 					rf.mu.Unlock()
 				}
+			}(i, rf.me, rf.currentTerm, rf.commitIndex, rf.nextIndex[i]-1, rf.log[rf.nextIndex[i]-1].Term, rf.log[rf.nextIndex[i]:])
+		} else {
+			go func(follower, leader, leaderTerm, leaderCommit int) {
+				req := AppendEntriesArgs{
+					Term:         leaderTerm,
+					LeaderId:     leader,
+					LeaderCommit: leaderCommit,
+				}
+				resp := AppendEntriesReply{
+				}
+				rf.sendAppendEntries(follower, &req, &resp)
 
-			}(i, rf.leaderId, rf.commitIndex, rf.nextIndex, rf.matchIndex, rf.log)
+				if resp.Term > leaderTerm {
+					rf.mu.Lock()
+					rf.turnFollower(resp.Term, leader)
+					rf.mu.Unlock()
+				}
+			}(i, rf.me, rf.currentTerm, rf.commitIndex)
 		}
 	}
 }
@@ -447,6 +464,7 @@ func (rf *Raft) preCheck() {
 	rf.mu.Unlock()
 
 	//提前保存所有变量，就可以减少持有锁的时间
+	//debug("-----------> server %d:commitIndex %d and lastApplied %v", rf.me, commitIndex, lastApplied)
 	if commitIndex > lastApplied {
 		go rf.apply(log, lastApplied+1, commitIndex)
 	}
@@ -466,7 +484,7 @@ func (rf *Raft) server() {
 	}
 }
 
-const EnableDebug = true
+const EnableDebug = false
 
 func debug(format string, a ...interface{}) {
 	if EnableDebug {
@@ -485,7 +503,7 @@ func (rf *Raft) synctElectionTimeout() time.Duration {
 }
 
 func (rf *Raft) serverAsLeader() {
-	rf.broadcastHeartbeats()
+	rf.broadcastAppendEntries()
 	time.Sleep(50 * time.Millisecond)
 }
 
@@ -558,29 +576,6 @@ func (rf *Raft) reinitialize() {
 	}
 }
 
-func (rf *Raft) broadcastHeartbeats() {
-	for i := range rf.peers {
-		if i != rf.me {
-			go func(follower, leader, leaderTerm, leaderCommit int) {
-				req := AppendEntriesArgs{
-					Term:         leaderTerm,
-					LeaderId:     leader,
-					LeaderCommit: leaderCommit,
-				}
-				resp := AppendEntriesReply{
-				}
-				rf.sendAppendEntries(follower, &req, &resp)
-
-				if resp.Term > leaderTerm {
-					rf.mu.Lock()
-					rf.turnFollower(resp.Term, leader)
-					rf.mu.Unlock()
-				}
-			}(i, rf.me, rf.currentTerm, rf.commitIndex)
-		}
-	}
-}
-
 func (rf *Raft) broadcastRequestVotes() {
 	for i := range rf.peers {
 		if i != rf.me {
@@ -636,7 +631,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.turnFollower(0, NoLeader)
 	rf.resetElectionTimeout()
 	rf.electLeaderNotify = make(chan bool)
-	rf.logCommittedNotify = make(chan bool)
 	rf.heartbeatNotify = make(chan bool, len(rf.peers))
 	rf.voteNotify = make(chan bool, len(rf.peers))
 	rf.log = []LogEntry{{}} //初始化一个空日志，保证真正的第一个日志的索引为1
@@ -644,7 +638,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.commitIndex = 0
 	rf.lastApplied = 0
-	rf.logReplicas = 0
 	rf.applyCh = applyCh
 	go rf.server()
 
