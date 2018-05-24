@@ -255,15 +255,23 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.turnFollower(rf.currentTerm, args.LeaderId)
 	}
 
-	//日志一致性check
-	//如果follower不包含preLogIndex和preLogTerm，则响应失败，表示日志不匹配
 	if !rf.hasLog(args.PreLogIndex, args.PreLogTerm) {
-		//截断与leader不一致的日志 （论文提到这里的截断日志的开销，可优化，但是优化收益并不大，见5.3最后）
-		end := minInt(args.PreLogIndex, len(rf.log))
-		rf.log = rf.log[:end]
 		reply.Term = args.Term
 		reply.Success = false
 		return
+	}
+
+	if len(args.Entries) > 0 {
+		//如果是普通日志append请求（非心跳请求），则进行日志一致性check，并截断不一致的日志（论文提到这里的截断日志的开销，可优化，但是优化收益并不大，见5.3最后）
+		var i int
+		for i = 0; i < len(args.Entries) && i+args.PreLogIndex+1 < len(rf.log); i++ {
+			selfLog := rf.log[i+args.PreLogIndex+1]
+			requestLog := args.Entries[i]
+			if selfLog.Term != requestLog.Term || selfLog.Command != requestLog.Command {
+				break
+			}
+		}
+		rf.log = rf.log[:i+args.PreLogIndex+1]
 	}
 
 	//追加新日志
@@ -406,13 +414,9 @@ func (rf *Raft) broadcastAppendEntries() {
 								}
 							}
 
-							debug("replicas of log %d is %d", n, replicas)
-
 							if replicas > len(rf.peers)/2 && rf.log[n].Term == leaderTerm {
 								rf.commitIndex = n
 							}
-
-							replicas = 0
 						}
 
 					} else if resp.Term == leaderTerm {
