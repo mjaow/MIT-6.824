@@ -271,12 +271,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				break
 			}
 		}
-		rf.log = rf.log[:i+args.PreLogIndex+1]
-	}
 
-	//追加新日志
-	for _, item := range args.Entries {
-		rf.log = append(rf.log, item)
+		rf.log = rf.log[:i+args.PreLogIndex+1]
+
+		//追加新日志
+		for _, item := range args.Entries {
+			rf.log = append(rf.log, item)
+		}
+
 	}
 
 	if args.LeaderCommit > rf.commitIndex {
@@ -289,7 +291,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 func (rf *Raft) apply(logs []LogEntry, start, end int) {
 	for i := start; i <= end; i++ {
-		debug("======> server %d:index %d and command %v", rf.me, i, logs[i].Command)
 		rf.applyCh <- ApplyMsg{
 			Index:   i,
 			Command: logs[i].Command,
@@ -409,7 +410,6 @@ func (rf *Raft) broadcastAppendEntries() {
 
 							for m := range rf.peers {
 								if rf.matchIndex[m] >= n {
-									//debug("log %d is match in server %d", n, m)
 									replicas++
 								}
 							}
@@ -428,10 +428,12 @@ func (rf *Raft) broadcastAppendEntries() {
 				}
 			}(i, rf.me, rf.currentTerm, rf.commitIndex, rf.nextIndex[i]-1, rf.log[rf.nextIndex[i]-1].Term, rf.log[rf.nextIndex[i]:])
 		} else {
-			go func(follower, leader, leaderTerm, leaderCommit int) {
+			go func(follower, leader, leaderTerm, leaderCommit, preLogIndex, preLogTerm int) {
 				req := AppendEntriesArgs{
 					Term:         leaderTerm,
 					LeaderId:     leader,
+					PreLogIndex:  preLogIndex,
+					PreLogTerm:   preLogTerm,
 					LeaderCommit: leaderCommit,
 				}
 				resp := AppendEntriesReply{
@@ -443,7 +445,7 @@ func (rf *Raft) broadcastAppendEntries() {
 					rf.turnFollower(resp.Term, leader)
 					rf.mu.Unlock()
 				}
-			}(i, rf.me, rf.currentTerm, rf.commitIndex)
+			}(i, rf.me, rf.currentTerm, rf.commitIndex, rf.nextIndex[i]-1, rf.log[rf.nextIndex[i]-1].Term)
 		}
 	}
 }
@@ -516,7 +518,6 @@ func (rf *Raft) serverAsCandidate() {
 	select {
 	case <-time.Tick(rf.synctElectionTimeout()):
 		rf.mu.Lock()
-		debug("candicate elect timeout")
 		rf.turnCandidate()
 		rf.mu.Unlock()
 	case <-rf.heartbeatNotify:
