@@ -470,7 +470,6 @@ func (rf *Raft) preCheck() {
 	rf.mu.Unlock()
 
 	//提前保存所有变量，就可以减少持有锁的时间
-	//debug("-----------> server %d:commitIndex %d and lastApplied %v", rf.me, commitIndex, lastApplied)
 	if commitIndex > lastApplied {
 		go rf.apply(log, lastApplied+1, commitIndex)
 	}
