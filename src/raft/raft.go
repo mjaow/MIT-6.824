@@ -71,6 +71,8 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	//workPermission chan bool //协程池
+
 	state             int           // 所属的状态
 	heartbeatNotify   chan bool     //心跳通知
 	voteNotify        chan bool     //投票通知
@@ -157,9 +159,7 @@ func (rf *Raft) readPersist(data []byte) {
 	d.Decode(&rf.CurrentTerm)
 	d.Decode(&rf.VotedFor)
 	d.Decode(&rf.Log)
-
 	debug("init server %d:term %d,votedfor %d,logs %+v", rf.me, rf.CurrentTerm, rf.VotedFor, rf.Log)
-
 }
 
 //
@@ -198,8 +198,8 @@ type AppendEntriesReply struct {
 	Success bool
 
 	//优化：存储冲突日志的index和term，便于leader收到这些信息，并快速更新nextIndex
-	//ConflictIndex int
-	//ConflictTerm  int
+	ConflictIndex int
+	ConflictTerm  int
 }
 
 func (rf *Raft) canVote(candidateId int, candidateLastLogIndex int, candidateLastLogTerm int) bool {
@@ -254,11 +254,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 }
 
-func (rf *Raft) hasLog(logIndex, logTerm int) bool {
-	log := rf.Log
-	return logIndex < len(log) && log[logIndex].Term == logTerm
-}
-
 //candidate或follower响应leader的AppendEntries请求
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
@@ -285,9 +280,29 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.turnFollower(rf.CurrentTerm, args.LeaderId)
 	}
 
-	if !rf.hasLog(args.PreLogIndex, args.PreLogTerm) {
+	//receiver没有索引为PreLogIndex的日志
+	if args.PreLogIndex >= len(rf.Log) {
 		reply.Term = args.Term
 		reply.Success = false
+		//由于不含有PreLogIndex位置的日志，也就是还没有发现冲突日志，可以认为冲突index为日志长度，冲突term为nil（-1）
+		reply.ConflictIndex = len(rf.Log)
+		reply.ConflictTerm = -1
+		return
+	}
+
+	//receiver索引为PreLogIndex的日志与leader的不一致
+	if args.PreLogTerm != rf.Log[args.PreLogIndex].Term {
+		reply.Term = args.Term
+		reply.Success = false
+
+		//从receiver日志中定位冲突日志的term，并找到该term第一个日志的索引，即冲突索引的位置
+		reply.ConflictTerm = rf.Log[args.PreLogIndex].Term
+		for i := range rf.Log {
+			if rf.Log[i].Term == reply.ConflictTerm {
+				reply.ConflictIndex = i
+				break
+			}
+		}
 		return
 	}
 
@@ -321,6 +336,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 func (rf *Raft) apply(logs []LogEntry, start, end int) {
 	for i := start; i <= end; i++ {
+		debug("======>server %d:commit log %+v at index %d", rf.me, logs[i].Command, i)
 		rf.applyCh <- ApplyMsg{
 			Index:   i,
 			Command: logs[i].Command,
@@ -414,29 +430,50 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
+type AppendEntriesRequest struct {
+	Follower     int
+	Term         int
+	LeaderId     int
+	PreLogIndex  int
+	PreLogTerm   int
+	Entries      []LogEntry
+	LeaderCommit int
+}
+
 func (rf *Raft) broadcastAppendEntries() {
 	for i := range rf.peers {
+		rf.mu.Lock()
 		if i == rf.me {
 			rf.matchIndex[i]++
 			rf.nextIndex[i]++
 		} else if rf.nextIndex[i] <= len(rf.Log)-1 {
-			go func(follower, leader, leaderTerm, leaderCommit, preLogIndex, preLogTerm int, appendLogs []LogEntry) {
+			request := AppendEntriesRequest{
+				Follower:     i,
+				Term:         rf.CurrentTerm,
+				LeaderId:     rf.me,
+				PreLogIndex:  rf.nextIndex[i] - 1,
+				PreLogTerm:   rf.Log[rf.nextIndex[i]-1].Term,
+				Entries:      rf.Log[rf.nextIndex[i]:],
+				LeaderCommit: rf.commitIndex,
+			}
+			go func(request AppendEntriesRequest) {
 				req := AppendEntriesArgs{
-					Term:         leaderTerm,
-					LeaderId:     leader,
-					PreLogIndex:  preLogIndex,
-					PreLogTerm:   preLogTerm,
-					Entries:      appendLogs,
-					LeaderCommit: leaderCommit,
+					Term:         request.Term,
+					LeaderId:     request.LeaderId,
+					PreLogIndex:  request.PreLogIndex,
+					PreLogTerm:   request.PreLogTerm,
+					Entries:      request.Entries,
+					LeaderCommit: request.LeaderCommit,
 				}
 				resp := AppendEntriesReply{}
-				if ok := rf.sendAppendEntries(follower, &req, &resp); ok {
+				if ok := rf.sendAppendEntries(request.Follower, &req, &resp); ok {
 					rf.mu.Lock()
-					if resp.Success {
-						rf.matchIndex[follower] = preLogIndex + len(appendLogs)
-						rf.nextIndex[follower] = rf.matchIndex[follower] + 1
 
-						for n := leaderCommit + 1; n < len(rf.Log); n++ {
+					if resp.Success {
+						rf.matchIndex[request.Follower] = request.PreLogIndex + len(request.Entries)
+						rf.nextIndex[request.Follower] = rf.matchIndex[request.Follower] + 1
+
+						for n := request.LeaderCommit + 1; n < len(rf.Log); n++ {
 
 							var replicas int
 
@@ -446,39 +483,76 @@ func (rf *Raft) broadcastAppendEntries() {
 								}
 							}
 
-							if replicas > len(rf.peers)/2 && rf.Log[n].Term == leaderTerm {
+							if replicas > len(rf.peers)/2 && rf.Log[n].Term == request.Term {
 								rf.commitIndex = n
 							}
 						}
 
-					} else if resp.Term == leaderTerm {
+					} else if resp.Term > request.Term {
+						rf.turnFollower(resp.Term, request.LeaderId)
+					} else if resp.Term == request.Term {
+						//1. 普通版本
 						//如果rpc请求响应ok，但是response.Success为false并且leader term没有过期，
 						// 则表示日志的一致性check检测到冲突，就将nextIndex减一
-						rf.nextIndex[follower]--
+						rf.nextIndex[request.Follower]--
+
+						//2. 优化版本
+						//找到最后一条term=冲突term的日志
+						//var n int
+						//for n = 0; n < len(rf.Log); n++ {
+						//	if rf.Log[n].Term == resp.ConflictTerm {
+						//		break
+						//	}
+						//}
+						//
+						////没有找到冲突term的日志
+						//if n == len(rf.Log) {
+						//	rf.nextIndex[follower] = resp.ConflictIndex
+						//} else {
+						//	for rf.Log[n].Term == resp.ConflictTerm {
+						//		n++
+						//	}
+						//	rf.nextIndex[follower] = n
+						//}
+						//rf.nextIndex[follower] = resp.ConflictIndex
 					}
 					rf.mu.Unlock()
 				}
-			}(i, rf.me, rf.CurrentTerm, rf.commitIndex, rf.nextIndex[i]-1, rf.Log[rf.nextIndex[i]-1].Term, rf.Log[rf.nextIndex[i]:])
+			}(request)
 		} else {
-			go func(follower, leader, leaderTerm, leaderCommit, preLogIndex, preLogTerm int) {
+			request := AppendEntriesRequest{
+				Follower:     i,
+				Term:         rf.CurrentTerm,
+				LeaderId:     rf.me,
+				PreLogIndex:  rf.nextIndex[i] - 1,
+				PreLogTerm:   rf.Log[rf.nextIndex[i]-1].Term,
+				LeaderCommit: rf.commitIndex,
+			}
+
+			go func(request AppendEntriesRequest) {
 				req := AppendEntriesArgs{
-					Term:         leaderTerm,
-					LeaderId:     leader,
-					PreLogIndex:  preLogIndex,
-					PreLogTerm:   preLogTerm,
-					LeaderCommit: leaderCommit,
+					Term:         request.Term,
+					LeaderId:     request.LeaderId,
+					PreLogIndex:  request.PreLogIndex,
+					PreLogTerm:   request.PreLogTerm,
+					LeaderCommit: request.LeaderCommit,
 				}
 				resp := AppendEntriesReply{
 				}
-				rf.sendAppendEntries(follower, &req, &resp)
-
-				if resp.Term > leaderTerm {
+				if ok := rf.sendAppendEntries(request.Follower, &req, &resp); ok {
 					rf.mu.Lock()
-					rf.turnFollower(resp.Term, leader)
+					if resp.Success {
+						//ignore
+					} else if resp.Term > request.Term {
+						rf.turnFollower(resp.Term, request.LeaderId)
+					} else if resp.Term == request.Term {
+						rf.nextIndex[request.Follower]--
+					}
 					rf.mu.Unlock()
 				}
-			}(i, rf.me, rf.CurrentTerm, rf.commitIndex, rf.nextIndex[i]-1, rf.Log[rf.nextIndex[i]-1].Term)
+			}(request)
 		}
+		rf.mu.Unlock()
 	}
 }
 
@@ -503,7 +577,7 @@ func (rf *Raft) preCheck() {
 
 	//提前保存所有变量，就可以减少持有锁的时间
 	if commitIndex > lastApplied {
-		go rf.apply(log, lastApplied+1, commitIndex)
+		rf.apply(log, lastApplied+1, commitIndex)
 	}
 }
 
@@ -521,7 +595,7 @@ func (rf *Raft) server() {
 	}
 }
 
-const EnableDebug = true
+const EnableDebug = false
 
 func debug(format string, a ...interface{}) {
 	if EnableDebug {
@@ -637,7 +711,6 @@ func (rf *Raft) broadcastRequestVotes() {
 					}
 				}
 				rf.mu.Unlock()
-
 			}(i, rf.me, rf.CurrentTerm, len(rf.Log)-1, rf.Log[len(rf.Log)-1].Term)
 
 		}
@@ -675,10 +748,13 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.applyCh = applyCh
-	go rf.server()
+	//rf.workPermission = make(chan bool, 100)
 
 	// initialize from state persisted before a crash
+	rf.mu.Lock()
 	rf.readPersist(persister.ReadRaftState())
+	rf.mu.Unlock()
+	go rf.server()
 
 	return rf
 }
