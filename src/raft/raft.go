@@ -607,11 +607,15 @@ func (rf *Raft) Kill() {
 //定期执行precheck可以保证所有committed的日志都会被apply
 func (rf *Raft) preCheck() {
 	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	if rf.commitIndex > rf.lastApplied {
-		go rf.apply(rf.Log, rf.lastApplied+1, rf.commitIndex)
+		lastApplied := rf.lastApplied
+		commitIndex := rf.commitIndex
+		log := rf.Log
 		rf.lastApplied = rf.commitIndex
+		rf.mu.Unlock()
+		rf.apply(log, lastApplied+1, commitIndex)
+	} else {
+		rf.mu.Unlock()
 	}
 }
 
