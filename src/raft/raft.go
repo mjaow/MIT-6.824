@@ -71,8 +71,6 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
-	//workPermission chan bool //协程池
-
 	state             int           // 所属的状态
 	heartbeatNotify   chan bool     //心跳通知
 	voteNotify        chan bool     //投票通知
@@ -276,10 +274,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = args.Term
 		reply.VoteGranted = true
 		rf.VotedFor = args.CandidatId
-
-		go func() {
-			rf.voteNotify <- true
-		}()
+		notifyChannelListener(rf.voteNotify)
 	} else {
 		//否则，投否决票，并将term更新为自己的term
 		reply.Term = rf.CurrentTerm
@@ -301,9 +296,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	go func() {
-		rf.heartbeatNotify <- true
-	}()
+	notifyChannelListener(rf.heartbeatNotify)
 
 	// 当rpc请求方term大于自己term时，立马转变为follower，并同步自己的term信息
 	if args.Term > rf.CurrentTerm {
@@ -348,7 +341,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			selfLog := rf.Log[i+args.PreLogIndex+1]
 			requestLog := args.Entries[i]
 			if selfLog.Term != requestLog.Term {
-				debug("logs diff for server %d and leader %d at index %d,term %d != leader term %d Or command %+v!=%+v.", rf.me, args.LeaderId, i+args.PreLogIndex+1, selfLog.Term, requestLog.Term, selfLog.Command, requestLog.Command)
 				break
 			}
 		}
@@ -504,6 +496,7 @@ func (rf *Raft) decreaseNextIndexFunc() func(rf *Raft, req AppendEntriesRequest,
 			for rf.Log[n].Term == resp.ConflictTerm {
 				n++
 			}
+			debug("==============>%d", req.Follower)
 			rf.nextIndex[req.Follower] = n
 		}
 	}
@@ -614,15 +607,11 @@ func (rf *Raft) Kill() {
 //定期执行precheck可以保证所有committed的日志都会被apply
 func (rf *Raft) preCheck() {
 	rf.mu.Lock()
-	commitIndex := rf.commitIndex
-	lastApplied := rf.lastApplied
-	log := rf.Log
-	rf.lastApplied = rf.commitIndex
-	rf.mu.Unlock()
+	defer rf.mu.Unlock()
 
-	//提前保存所有变量，就可以减少持有锁的时间
-	if commitIndex > lastApplied {
-		rf.apply(log, lastApplied+1, commitIndex)
+	if rf.commitIndex > rf.lastApplied {
+		go rf.apply(rf.Log, rf.lastApplied+1, rf.commitIndex)
+		rf.lastApplied = rf.commitIndex
 	}
 }
 
@@ -689,9 +678,6 @@ func (rf *Raft) serverAsFollower() {
 		//收到心跳请求，状态不变
 	}
 }
-func (raft *Raft) isHeartbeat(args AppendEntriesArgs) bool {
-	return true
-}
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	return rf.peers[server].Call("Raft.AppendEntries", args, reply)
@@ -731,17 +717,23 @@ func (rf *Raft) reinitialize() {
 	}
 }
 
+func notifyChannelListener(c chan bool) {
+	go func() {
+		c <- true
+	}()
+}
+
 func (rf *Raft) broadcastRequestVotes() {
 	rf.mu.Lock()
 	for i := range rf.peers {
-		request := RequestVotesRequest{
-			Target:       i,
-			Term:         rf.CurrentTerm,
-			Candidate:    rf.me,
-			LastLogIndex: len(rf.Log) - 1,
-			LastLogTerm:  rf.Log[len(rf.Log)-1].Term,
-		}
 		if i != rf.me {
+			request := RequestVotesRequest{
+				Target:       i,
+				Term:         rf.CurrentTerm,
+				Candidate:    rf.me,
+				LastLogIndex: len(rf.Log) - 1,
+				LastLogTerm:  rf.Log[len(rf.Log)-1].Term,
+			}
 			//只有请求成功再计算票数
 			go func(request RequestVotesRequest) {
 				req := RequestVoteArgs{
@@ -759,9 +751,7 @@ func (rf *Raft) broadcastRequestVotes() {
 					}
 					if rf.votedCount > len(rf.peers)/2 {
 						rf.turnLeader()
-						go func() {
-							rf.electLeaderNotify <- true
-						}()
+						notifyChannelListener(rf.electLeaderNotify)
 					}
 				}
 				rf.mu.Unlock()
@@ -803,12 +793,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.applyCh = applyCh
-	//rf.workPermission = make(chan bool, 100)
 
 	// initialize from state persisted before a crash
-	rf.mu.Lock()
 	rf.readPersist(persister.ReadRaftState())
-	rf.mu.Unlock()
 	go rf.server()
 
 	return rf
