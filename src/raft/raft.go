@@ -87,6 +87,11 @@ type Raft struct {
 	//用户提交的channel
 	applyCh chan ApplyMsg //提交的日志，该channel是client传递给raft的一个参数，用于监听提交的消息
 
+	//raft instance是否完成任务
+	// 启动初始化为false，保证不断执行raft工作，
+	// 被kill之后切换为true，表示任务已经完成，优雅退出所有正在执行的任务
+	done bool
+
 	//所有server上的volatile数据
 	commitIndex int // 最新的已提交日志的index  单调递增
 	lastApplied int // 最新的已apply日志的index 单调递增
@@ -94,6 +99,12 @@ type Raft struct {
 	//leader上的volatile数据，用数组存储用来维护每个server的index信息
 	nextIndex  []int // 即将要发送给所有server的日志
 	matchIndex []int // 已发送给所有server的日志的最高index
+}
+
+func (rf *Raft) isDone() bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.done
 }
 
 // return CurrentTerm and whether this server
@@ -496,7 +507,6 @@ func (rf *Raft) decreaseNextIndexFunc() func(rf *Raft, req AppendEntriesRequest,
 			for rf.Log[n].Term == resp.ConflictTerm {
 				n++
 			}
-			debug("==============>%d", req.Follower)
 			rf.nextIndex[req.Follower] = n
 		}
 	}
@@ -534,9 +544,9 @@ func (rf *Raft) broadcastAppendEntries() {
 					LeaderCommit: request.LeaderCommit,
 				}
 				resp := AppendEntriesReply{}
-				if ok := rf.sendAppendEntries(request.Follower, &req, &resp); ok {
-					rf.mu.Lock()
-
+				ok := rf.sendAppendEntries(request.Follower, &req, &resp)
+				rf.mu.Lock()
+				if ok {
 					rf.handleReply(request, resp, func(rf *Raft, req AppendEntriesRequest, resp AppendEntriesReply) {
 						rf.matchIndex[req.Follower] = req.PreLogIndex + len(req.Entries)
 						rf.nextIndex[req.Follower] = rf.matchIndex[req.Follower] + 1
@@ -557,8 +567,8 @@ func (rf *Raft) broadcastAppendEntries() {
 						}
 					}, rf.turnFollowerFunc(), rf.decreaseNextIndexFunc())
 
-					rf.mu.Unlock()
 				}
+				rf.mu.Unlock()
 			}(request)
 		} else {
 			request := AppendEntriesRequest{
@@ -580,14 +590,14 @@ func (rf *Raft) broadcastAppendEntries() {
 				}
 				resp := AppendEntriesReply{
 				}
-				if ok := rf.sendAppendEntries(request.Follower, &req, &resp); ok {
-					rf.mu.Lock()
+				ok := rf.sendAppendEntries(request.Follower, &req, &resp)
+				rf.mu.Lock()
+				if ok {
 					rf.handleReply(request, resp, func(rf *Raft, req AppendEntriesRequest, resp AppendEntriesReply) {
 						//Do Nothing
 					}, rf.turnFollowerFunc(), rf.decreaseNextIndexFunc())
-
-					rf.mu.Unlock()
 				}
+				rf.mu.Unlock()
 			}(request)
 		}
 	}
@@ -602,6 +612,11 @@ func (rf *Raft) broadcastAppendEntries() {
 //
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
+	//等待所有goroutine退出
+	rf.mu.Lock()
+	rf.done = true
+	rf.mu.Unlock()
+	//rf.workQ.Wait()
 }
 
 //定期执行precheck可以保证所有committed的日志都会被apply
@@ -620,7 +635,7 @@ func (rf *Raft) preCheck() {
 }
 
 func (rf *Raft) server() {
-	for {
+	for !rf.isDone() {
 		rf.preCheck()
 		switch rf.SyncState() {
 		case Leader:
@@ -738,6 +753,7 @@ func (rf *Raft) broadcastRequestVotes() {
 				LastLogIndex: len(rf.Log) - 1,
 				LastLogTerm:  rf.Log[len(rf.Log)-1].Term,
 			}
+
 			//只有请求成功再计算票数
 			go func(request RequestVotesRequest) {
 				req := RequestVoteArgs{
@@ -797,6 +813,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 	rf.applyCh = applyCh
+	rf.done = false
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
