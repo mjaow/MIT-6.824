@@ -162,7 +162,9 @@ func GenericTest(t *testing.T, tag string, nclients int, unreliable bool, crash 
 					j++
 				} else {
 					// log.Printf("%d: client new get %v\n", cli, key)
+					DPrintf("==============>client %d Get key %s before", cli, key)
 					v := myck.Get(key)
+					DPrintf("==============>client %d Get key %s after", cli, key)
 					if v != last {
 						log.Fatalf("get wrong value, key %v, wanted:\n%v\n, got\n%v\n", key, last, v)
 					}
@@ -180,6 +182,7 @@ func GenericTest(t *testing.T, tag string, nclients int, unreliable bool, crash 
 		atomic.StoreInt32(&done_clients, 1)     // tell clients to quit
 		atomic.StoreInt32(&done_partitioner, 1) // tell partitioner to quit
 
+		DPrintf("pass 1")
 		if partitions {
 			// log.Printf("wait for partitioner\n")
 			<-ch_partitioner
@@ -191,7 +194,7 @@ func GenericTest(t *testing.T, tag string, nclients int, unreliable bool, crash 
 			// wait for a while so that we have a new term
 			time.Sleep(electionTimeout)
 		}
-
+		DPrintf("pass 2")
 		if crash {
 			// log.Printf("shutdown servers\n")
 			for i := 0; i < nservers; i++ {
@@ -207,20 +210,25 @@ func GenericTest(t *testing.T, tag string, nclients int, unreliable bool, crash 
 			}
 			cfg.ConnectAll()
 		}
-
+		DPrintf("pass 3")
 		// log.Printf("wait for clients\n")
 		for i := 0; i < nclients; i++ {
 			// log.Printf("read from clients %d\n", i)
+			DPrintf("pass 3 %d", i)
 			j := <-clnts[i]
+			DPrintf("pass 3 %d i", i)
 			if j < 10 {
 				log.Printf("Warning: client %d managed to perform only %d put operations in 1 sec?\n", i, j)
 			}
 			key := strconv.Itoa(i)
 			// log.Printf("Check %v for client %d\n", j, i)
+			DPrintf("pass 3 %d ii", i)
 			v := ck.Get(key)
+			DPrintf("pass 3 %d iii", i)
 			checkClntAppends(t, i, v, j)
 		}
 
+		DPrintf("pass 4")
 		if maxraftstate > 0 {
 			// Check maximum after the servers have processed all client
 			// requests and had time to checkpoint

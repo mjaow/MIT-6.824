@@ -101,6 +101,12 @@ type Raft struct {
 	matchIndex []int // 已发送给所有server的日志的最高index
 }
 
+func (rf *Raft) GetLeader() (int, bool) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	return rf.leaderId, rf.state == Leader
+}
+
 func (rf *Raft) isDone() bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
