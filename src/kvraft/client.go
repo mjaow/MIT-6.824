@@ -4,18 +4,18 @@ import "labrpc"
 import "crypto/rand"
 import (
 	"math/big"
-	sr "math/rand"
+	"sync"
 )
 
 type Clerk struct {
+	mu      sync.Mutex
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
 
 	//由于client很多而server很少，所以使用int64来修饰clientid，int来修饰serverid
 	id             int64 //client id，生成大随机数来代表
-	lastSeenLeader int   //记录最近一次看到订单leader id
-
-	seq int //消息序列号，属于该client的消息唯一标示符
+	seq            int   //消息序列号，属于该client的消息唯一标示符
+	possibleLeader int   //概率性较高的leader
 }
 
 func nrand() int64 {
@@ -30,7 +30,6 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck.servers = servers
 	// You'll have to add code here.
 	ck.id = nrand()
-	ck.lastSeenLeader = NoneLeader
 	return ck
 }
 
@@ -47,44 +46,29 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) Get(key string) string {
-	DPrintf("client get %s start====", key)
-	defer DPrintf("client get %s done====", key)
 	// You will have to modify this function.
 	args := GetArgs{
 		Key:      key,
 		ClientId: ck.id,
 	}
+	var i int
 	for {
-		ck.nextLeader()
+		i = ck.getLeader()
 		reply := GetReply{}
 
-		DPrintf("peek servers %d", ck.lastSeenLeader)
-
-		if !ck.servers[ck.lastSeenLeader].Call("RaftKV.Get", &args, &reply) {
-			ck.lastSeenLeader = NoneLeader
-			continue
-		}
-
-		if reply.WrongLeader {
-			ck.lastSeenLeader = reply.LeaderId
+		if ok := ck.servers[i].Call("RaftKV.Get", &args, &reply); !ok || reply.WrongLeader {
+			ck.updateLeader((i + 1) % len(ck.servers))
 			continue
 		}
 
 		if reply.Err != OK {
-			ck.lastSeenLeader = NoneLeader
 			continue
 		}
 
+		ck.updateLeader(i)
 		return reply.Value
 	}
 	return ""
-}
-
-func (ck *Clerk) nextLeader() {
-	//if ck.lastSeenLeader == NoneLeader {
-		//用simple random generator猜测leader id
-		ck.lastSeenLeader = sr.Intn(len(ck.servers))
-	//}
 }
 
 //
@@ -98,43 +82,56 @@ func (ck *Clerk) nextLeader() {
 // arguments. and reply must be passed as a pointer.
 //
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	DPrintf("client %s %s %s start====", op, key, value)
-	defer DPrintf("client %s %s %s done====", op, key, value)
 	// You will have to modify this function.
 	args := PutAppendArgs{
 		Key:      key,
 		Value:    value,
 		Op:       op,
 		ClientId: ck.id,
-		Seq:      ck.seq,
+		Seq:      ck.getAndIncSeq(1),
 	}
+	var i int
 	for {
-		ck.nextLeader()
+		i = ck.getLeader()
 		reply := PutAppendReply{}
 
-		if !ck.servers[ck.lastSeenLeader].Call("RaftKV.PutAppend", &args, &reply) {
-			ck.lastSeenLeader = NoneLeader
-			continue
-		}
-
-		if reply.WrongLeader {
-			ck.lastSeenLeader = reply.LeaderId
+		if ok := ck.servers[i].Call("RaftKV.PutAppend", &args, &reply); !ok || reply.WrongLeader {
+			ck.updateLeader((i + 1) % len(ck.servers))
 			continue
 		}
 
 		if reply.Err != OK {
-			ck.lastSeenLeader = NoneLeader
 			continue
 		}
 
-		ck.seq++
+		ck.updateLeader(i)
 		return
 	}
 }
 
+func (ck *Clerk) updateLeader(leaderId int) {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	ck.possibleLeader = leaderId
+}
+
+func (ck *Clerk) getLeader() int {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	return ck.possibleLeader
+}
+
+func (ck *Clerk) getAndIncSeq(diff int) int {
+	ck.mu.Lock()
+	defer ck.mu.Unlock()
+	tmp := ck.seq
+	ck.seq += diff
+	return tmp
+}
+
 func (ck *Clerk) Put(key string, value string) {
-	ck.PutAppend(key, value, "Put")
+	ck.PutAppend(key, value, Put)
 }
 func (ck *Clerk) Append(key string, value string) {
-	ck.PutAppend(key, value, "Append")
+	ck.PutAppend(key, value, Append)
 }

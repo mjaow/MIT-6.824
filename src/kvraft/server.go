@@ -22,11 +22,12 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Key      string
-	Value    string
-	Op       string
-	ClientId int64
-	Seq      int
+	Key         string
+	Value       string
+	Op          string
+	ClientId    int64
+	Seq         int
+	Term        int
 }
 
 type RaftKV struct {
@@ -39,33 +40,27 @@ type RaftKV struct {
 
 	// Your definitions here.
 	database  map[string]string
-	clientSeq map[int64]int //为每个client维护的最大消息seq，通过不接受较低seq来去除重复request，保证request幂等性
-	opDone    chan string
-	noopDone  chan string
+	clientSeq map[int64]int   //为每个client维护的最大消息seq，通过不接受较低seq来去除重复request，保证request幂等性
+	opDone    map[int]chan Op //为每个消息维护一个channel，每当这个消息被提交，op->opDone
+
+	done bool //server端任务是否完结
 }
 
 func (kv *RaftKV) Get(args *GetArgs, reply *GetReply) {
-	DPrintf("%d:server get %s start====", kv.me, args.Key)
-	defer DPrintf("%d:server get %s done====", kv.me, args.Key)
 	// Your code here.
-	if _, _, isLeader := kv.rf.Start(kv.GetCommand(args)); !isLeader {
+	if index, term, isLeader := kv.rf.Start(kv.GetCommand(args)); !isLeader {
 		reply.WrongLeader = true
-		reply.Err = "Not leader"
-		leaderId, _ := kv.rf.GetLeader()
-		reply.LeaderId = leaderId
-		return
-	}
-	DPrintf("%d:prepare get value by key %s", kv.me, args.Key)
-	select {
-	case val := <-kv.noopDone:
-		DPrintf("%d:Start get value by key %s", kv.me, args.Key)
-		reply.WrongLeader = false
-		reply.Value = val
-		reply.Err = OK
-	case <-time.After(CommandTimeout * time.Millisecond):
-		DPrintf("%d:Failed get value by key %s", kv.me, args.Key)
-		reply.Err = "timeout"
-		reply.WrongLeader = false
+	} else {
+		kv.mu.Lock()
+		done := kv.getOpFromMap(index)
+		kv.mu.Unlock()
+		select {
+		case op := <-done:
+			reply.WrongLeader = op.Term != term
+			reply.Value = op.Value
+			reply.Err = OK
+		case <-time.After(CommandTimeout * time.Millisecond):
+		}
 	}
 }
 
@@ -73,6 +68,7 @@ func (kv *RaftKV) GetCommand(args *GetArgs) Op {
 	return Op{
 		Key:      args.Key,
 		ClientId: args.ClientId,
+		Op:       Get,
 	}
 }
 
@@ -86,36 +82,38 @@ func (kv *RaftKV) PutAppendCommand(args *PutAppendArgs) Op {
 	}
 }
 
+func (kv *RaftKV) getOpFromMap(index int) chan Op {
+	if op, ok := kv.opDone[index]; !ok {
+		op = make(chan Op, 1)
+		kv.opDone[index] = op
+		return op
+	} else {
+		return op
+	}
+}
+
 func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	DPrintf("%d:server %s %s %s start====", kv.me, args.Op, args.Key, args.Value)
-	defer DPrintf("%d:server %s %s %s done====", kv.me, args.Op, args.Key, args.Value)
 	// Your code here.
 	kv.mu.Lock()
 	seq, seqExist := kv.clientSeq[args.ClientId]
 	kv.mu.Unlock()
 	if seqExist && args.Seq <= seq {
-		reply.WrongLeader = false
 		reply.Err = OK
 		return
 	}
 
-	if _, _, isLeader := kv.rf.Start(kv.PutAppendCommand(args)); !isLeader {
+	if index, term, isLeader := kv.rf.Start(kv.PutAppendCommand(args)); !isLeader {
 		reply.WrongLeader = true
-		reply.Err = "Not leader"
-		leaderId, _ := kv.rf.GetLeader()
-		reply.LeaderId = leaderId
-		return
-	}
-	DPrintf("%d:prepare set value for key %s", kv.me, args.Key)
-	select {
-	case <-kv.opDone:
-		DPrintf("%d:start set value for key %s", kv.me, args.Key)
-		reply.WrongLeader = false
-		reply.Err = OK
-	case <-time.After(CommandTimeout * time.Millisecond):
-		DPrintf("%d:failed set value for key %s", kv.me, args.Key)
-		reply.WrongLeader = false
-		reply.Err = "timeout"
+	} else {
+		kv.mu.Lock()
+		done := kv.getOpFromMap(index)
+		kv.mu.Unlock()
+		select {
+		case op := <-done:
+			reply.WrongLeader = op.Term != term
+			reply.Err = OK
+		case <-time.After(CommandTimeout * time.Millisecond):
+		}
 	}
 }
 
@@ -128,6 +126,15 @@ func (kv *RaftKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 func (kv *RaftKV) Kill() {
 	kv.rf.Kill()
 	// Your code here, if desired.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	kv.done = true
+}
+
+func (kv *RaftKV) isDone() bool {
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	return kv.done
 }
 
 //
@@ -155,45 +162,36 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 	kv.database = make(map[string]string)
 	kv.clientSeq = make(map[int64]int)
-	kv.opDone = make(chan string)
-	kv.noopDone = make(chan string)
+	kv.opDone = make(map[int]chan Op)
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+	kv.done = false
 
 	// You may need initialization code here.
 
 	go func() {
-		for {
-			msg := (<-kv.applyCh).Command.(Op)
-
-			if msg.Op == "Put" || msg.Op == "Append" {
-				kv.mu.Lock()
-				if seq, ok := kv.clientSeq[msg.ClientId]; !ok || seq < msg.Seq {
-					kv.clientSeq[msg.ClientId] = msg.Seq
-
-					if msg.Op == "Put" {
-						kv.database[msg.Key] = msg.Value
-					} else {
-						kv.database[msg.Key] += msg.Value
-					}
-
-				}
-
-				kv.mu.Unlock()
-				if _, isLeader := kv.rf.GetLeader(); isLeader {
-					kv.opDone <- msg.Value
-				}
-			} else {
+		for !kv.isDone() {
+			msg := <-kv.applyCh
+			index := msg.Index
+			op := msg.Command.(Op)
+			term, _ := kv.rf.GetState()
+			op.Term = term
+			kv.mu.Lock()
+			done := kv.getOpFromMap(index)
+			if op.Op == Get {
 				DPrintf("no op come")
-				kv.mu.Lock()
-				val := kv.database[msg.Key]
-				kv.mu.Unlock()
-				if _, isLeader := kv.rf.GetLeader(); isLeader {
-					kv.noopDone <- val
+				op.Value = kv.database[op.Key]
+			} else if seq, ok := kv.clientSeq[op.ClientId]; !ok || seq < op.Seq {
+				kv.clientSeq[op.ClientId] = op.Seq
+				if op.Op == Put {
+					kv.database[op.Key] = op.Value
+				} else {
+					kv.database[op.Key] += op.Value
 				}
 			}
-			DPrintf("me %d Notify key value [%s:%s]", kv.me, msg.Key, msg.Value)
+			kv.mu.Unlock()
+			done <- op
 		}
 	}()
 
