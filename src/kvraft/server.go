@@ -22,12 +22,12 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Key         string
-	Value       string
-	Op          string
-	ClientId    int64
-	Seq         int
-	Term        int
+	Key      string
+	Value    string
+	Op       string
+	ClientId int64
+	Seq      int
+	Term     int
 }
 
 type RaftKV struct {
@@ -191,7 +191,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 				}
 			}
 			kv.mu.Unlock()
-			done <- op
+			go func() {
+				done <- op
+			}()
 		}
 	}()
 
